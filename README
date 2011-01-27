@@ -1,0 +1,4 @@
+This is a simple bash script for running all nova services in a screen
+and providing you with a window in screen for running commands.
+
+It will create a user and project named 'admin' and source your configuration.

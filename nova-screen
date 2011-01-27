@@ -1,0 +1,258 @@
+#!/bin/bash
+
+# This script runs all nova components in windows of a singe screen.
+# Arguments: [nova.conf] [novarc]
+
+function locate_binary {
+	# Called with the basename of a binary, like nova-api
+	# If we are in a nova checkout, use the bin/* version.
+	# Otherwise, get whatever is in ${PATH} for system wide nova
+	bin_name=${1}
+	var_name=`echo ${bin_name} | sed -e s.-._.`
+	if [ -d bin ] && [ -f bin/${bin_name} ] ; then
+		eval ${var_name}="bin/${bin_name}"
+	else
+		rv=`which ${bin_name}`
+		if [ -z "${rv}" ] ; then
+			echo "FATAL: Unable to find a suitable ${bin_name}"
+			echo "    Either use ${BASH_SOURCE} from a bzr checkout of nova"
+			echo "    or put ${bin_name} in your \$PATH"
+			exit 1
+		fi
+		eval ${var_name}="${rv}"
+	fi
+}
+
+function screen_is_running {
+	# Check for a running screen session
+	# You can specify a session name other than nova by providing an argument
+	# Returns 0 if running, 1 otherwise
+	# Can be used in bash conditionals
+	session_name=${1}
+	if [ -z "${session_name}" ] ; then
+		session_name=nova
+	fi
+	captured=`screen -ls | grep ${session_name}`
+	if [ -z "${captured}" ] ; then
+		return 1 # not running
+	fi
+	return 0
+}
+
+function start_screen {
+	# Starts a new screen session
+	# You can specify a session name other than nova by providing an argument
+	session_name=${1}
+	if [ -z "${session_name}" ] ; then
+		session_name=nova
+	fi
+	screen_is_running ${session_name}
+	if [ $? == 0 ] ; then
+		echo "FATAL: screen session ${session_name} already exists"
+		exit 1
+	fi
+	# -d -m creates a new detached session per screen(1)
+	# -S names the session which we will use to attach to later
+	# -t names the particular window in screen we can attach to later
+	screen -d -m -S ${session_name} -t default
+}
+
+function add_to_screen {
+	# Add a command to a new window in an existing screen session
+	# Arguments: session-name command
+	session_name=${1}
+	command=${2}
+	if [ -z "${command}" ] ; then
+		echo "INVALID USAGE: add_to_screen session-name command"
+		return
+	fi
+	screen_is_running ${session_name}
+	if [ $? == 1 ] ; then
+		echo "ERROR: No running screen session named ${session_name}"
+		echo "    Skipping command ${command}"
+		return
+	fi
+	basename=`echo ${command} | awk '{print $1}' | xargs basename`
+	# -X screen_command sends a screen internal command
+	# (as would be produced by a keystroke, not a command like a shell command)
+	# see screen(1) sections DEFAULT KEY BINDINGS and CUSTOMIZATION
+	# 'screen' is equivilent to C-a C-c, which creates a new window
+	screen -S ${session_name} -X screen -t ${basename}
+	# ASCII Carriage Return to emulate pressing enter.
+	CR=`echo -ne '\r'`
+	# -p selects a window by name (paired with -t in screen command above)
+	# the stuff command puts the text in screen's input buffer
+	# this throws the command, followed by enter, to the shell running in screen
+	screen -S ${session_name} -p ${basename} -X stuff "${command}${CR}"
+}
+
+function build_screen_keymap {
+	# Map F1 key to windowlist
+	# You can specify a session name other than nova by providing an argument
+	session_name=${1}
+	if [ -z "${session_name}" ] ; then
+		session_name=nova
+	fi
+	screen_is_running ${session_name}
+	if [ $? == 1 ] ; then
+		echo "ERROR: No running screen session named ${session_name}"
+		echo "    Can't add key bindings"
+		return
+	fi
+	screen -S ${session_name} -X bindkey -k k1 windowlist -b
+}
+
+function drop_from_screen {
+	# Kill a window in a screen
+	# Arguments: session_name window_name
+	session_name=${1}
+	window_name=${2}
+	if [ -z "${window_name}" ] ; then
+		echo "INVALID USAGE: drop_from_screen session-name window-name"
+		return
+	fi
+	screen_is_running ${session_name}
+	if [ $? == 1 ] ; then
+		echo "ERROR: No running screen session named ${session_name}"
+		echo "    Can't drop window ${window_name}"
+		return
+	fi
+	screen -S ${session_name} -p ${window_name} -X kill
+}
+
+function attach_to_screen {
+	# Attaches to a running but detached screen
+	# You can specify a session name other than nova by providing an argument
+	session_name=${1}
+	if [ -z "${session_name}" ] ; then
+		session_name=nova
+	fi
+	screen -S ${session_name} -r
+}
+
+function build_screen {
+	# Launch all the components in a screen session and attach to it
+	session_name=${1}
+	if [ -z "${session_name}" ] ; then
+		session_name=nova
+	fi
+	start_screen "${session_name}"
+	add_to_screen "${session_name}" "${nova_api} --flagfile=${flagfile}"
+	add_to_screen "${session_name}" "${nova_compute} --flagfile=${flagfile}"
+	add_to_screen "${session_name}" "${nova_network} --flagfile=${flagfile}"
+	add_to_screen "${session_name}" "${nova_volume} --flagfile=${flagfile}"
+	add_to_screen "${session_name}" "${nova_objectstore} --flagfile=${flagfile}"
+	add_to_screen "${session_name}" "${nova_scheduler} --flagfile=${flagfile}"
+	add_to_screen "${session_name}" "source ${BASH_SOURCE}"
+	drop_from_screen "${session_name}" default
+	build_screen_keymap "${session_name}"
+	attach_to_screen "${session_name}"
+}
+
+function determine_flagfile {
+	# Try to find a flagfile to use.
+	# Check the first argument for explictness.  Try some defaults othereise.
+	flagfile=${1}
+	if [ ! -z "${flagfile}" ] ; then
+		if [ ! -f ${flagfile} ] ; then
+			echo "WARNING: can't find flagfile: ${flagfile}"
+		fi
+		return
+	fi
+	# Try a local version
+	if [ -f nova.conf ] ; then
+		flagfile="nova.conf"
+		return
+	fi
+	# Try another local version (compatible with nova.sh)
+	if [ -f bin/nova.conf ] ; then
+		flagfile="bin/nova.conf"
+		return
+	fi
+	# Try the system version
+	if [ -f /etc/nova/nova.conf ] ; then
+		flagfile="/etc/nova/nova.conf"
+		return
+	fi
+	echo "WARNING: no flagfile found, using built-in settings"
+	flagfile=""
+}
+
+function display_welcome {
+	clear
+	echo Thanks for using nova!
+	echo 
+	echo Your services have been started, you can view their screens by using
+	echo C-a \" \(Thats Control+a, then press \"\) to view a list of windows and
+	echo select the one you want to see.  You can return here by selecting
+	echo the window named \"source\".
+	echo 
+	echo You should now be able to use euca2ools \(euca-run-instances, etc\)
+	echo to interact with your cloud.
+	echo 
+}
+
+function setup_user_and_project {
+	novarc=${1}
+	if [ ! -z "${novarc}" ] ; then
+		# if you already have user credentials set, we'll use them
+		return
+	fi
+	user=`${nova_manage} --flagfile=${flagfile} user list | grep admin`
+	if [ -z "${user}" ] ; then
+		${nova_manage} --flagfile=${flagfile} user admin admin
+	fi
+	project=`${nova_manage} --flagfile=${flagfile} project list | grep admin`
+	if [ -z "${project}" ] ; then
+		${nova_manage} --flagfile=${flagfile} project create admin admin
+	fi
+
+}
+
+function source_nova_rc {
+	# Load novarc, can be passed in as argument, found as novarc, or built new
+	novarc=${1}
+	if [ ! -z "${novarc}" ] ; then
+		source ${novarc}
+		return
+	fi
+	if [ -f novarc ] ; then
+		source novarc
+		return
+	fi
+	# already aliased
+	${nova_manage} --flagfile=${flagfile} project zipfile admin admin /tmp/admin.zip
+	unzip -d /tmp /tmp/admin.zip novarc
+	source /tmp/novarc
+	rm /tmp/admin.zip
+	rm /tmp/novarc
+}
+
+# find binaries or die trying
+# sets $nova_api, etc as variables
+locate_binary nova-api
+locate_binary nova-compute
+locate_binary nova-network
+locate_binary nova-volume
+locate_binary nova-scheduler
+locate_binary nova-objectstore
+locate_binary nova-manage
+
+determine_flagfile "${1}"
+
+if [ $0 == ${BASH_SOURCE} ] ; then
+	# run from command line, make the screen
+	build_screen
+	echo "Screen Detached"
+	echo -ne '\a'
+else
+	# sourced by bash, load the window with help and a good environment
+	alias nova-manage="${nova_manage} --flagfile=${flagfile}"
+	PS1="[nova-screen]${PS1}"
+	display_welcome
+	setup_user_and_project "${2}"
+	source_nova_rc "${2}"
+	${nova_manage} --flagfile=${flagfile} service enable `hostname` nova-compute
+	${nova_manage} --flagfile=${flagfile} service enable `hostname` nova-network
+	${nova_manage} --flagfile=${flagfile} service enable `hostname` nova-volume
+fi
